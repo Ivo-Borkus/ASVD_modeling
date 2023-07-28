@@ -1,0 +1,358 @@
+---
+title: "Untitled"
+output: html_document
+date: "2023-07-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# This is the code used for the practical part of the thesis aimed at unraveling the biology behind atherosclerotic disease progression. 
+
+## Analysing the transcriptomic data by two machine learning models was achieved in multiple steps:
+
+### Step 1: 
+
+Here the two data sets are loaded in using the correct paths to the meta data file and the RNA expression file.
+After which DESEQ2 normalisation is applied. Beause normalisation using differntial expression requires the samples to be split in two classes, a condition argument was formulated to split the data set. However, because the DESEQ package was not used after normalisation, this condition argument became irrelavent after the normalisation
+
+
+```{r}
+data_meta <- read.delim(
+  '', 
+  header = TRUE, #In order to ensure the variable names are headers
+  sep = "\t", # tab delimeted file
+  row.names = 1) # the genes on first row are actually the row names
+
+data <- read.delim(
+  '',
+  header = TRUE, 
+  sep = "\t",
+  row.names = 1)
+
+
+data_meta$condition <- ifelse(data_meta$symptoms_inclusion %in%
+                                c("TIA","stroke"),"severe", "mild") # making a condition argument
+
+condition <- cbind(rownames(data_meta),data_meta$condition) # new df of gene names and condition
+
+rownames(condition) <- condition[,1] # let the names of rows  be the genes
+
+ordered_condition <- condition[order(row.names(condition)),] # order the rows
+ordered_data <- data[, order(names(data))] # order the gene expression data
+
+# ordering is necessary in order to create equal databases (meta_data and data)
+
+condition2 <- data.frame(ordered_colls[,-1]) # get rid of the gene variable
+colnames(condition2) <- c('condition') # make sure the variable is easily called
+
+
+dds <- DESeqDataSetFromMatrix(ordered_data, condition2, design = ~condition)
+keep <- rowSums(counts(dds)) >= 10
+ddsDE <- DESeq(dds)
+
+# This is the important part as the data set is normalised using this code. 
+# Afterwards NAs in gene expression are removed
+
+normCounts <- counts(ddsDE, normalized = TRUE)
+normCounts <- na.omit(normCounts)
+
+
+
+# After the normalisation file is created, python code in the file named 'final.py' will reduce the dimensions
+
+# write.csv(normCounts, 'data/normalised_RNAseq_noNa.csv') this is the file created and will be used in the 'final.py' script to reduce dimensions
+
+
+```
+
+### Step 2: Apply PCA on the normalised gene expression data set in python
+
+Code and comments available in the 'final.py' script
+
+### Step 3: For logistic regression apply a stepwise algorithm.
+
+This is necessary to see which principle components orchestrate the best possible model for secondary event prediction
+
+
+```{r}
+
+# This code makes sure the PCA data frame has PC 1 through 50 as header names and patient samples as rows:
+
+
+michal_pca <- read.csv('data/PCA_michal.csv', header = TRUE, row.names = 1) # this data set has headers and rows neatly organised.
+
+dpca <- read.csv('data/PCA_ivo_50.csv', header = TRUE, row.names = 1) # the dimension reduced data frame from final.py! 
+dpca$class <- michal_pca$class
+row_names <- rownames(michal_pca) # copying the rownames of the data frame
+col_names <- colnames(michal_pca) # copying the PC features of the data frame
+
+rownames(dpca) <- row_names
+colnames(dpca) <- col_names
+
+# dpca is now the main data frame to use in the analysis
+```
+
+Here the code for the stepwise algorithm is presented
+
+```{r}
+set.seed(1111)
+library(magrittr)
+library(caTools)
+
+
+data <- dpca # the data frame dpca (which is the dataframe with PCA reduction) is now called as data
+
+data <- na.omit(data) # removing further NAs in the data set
+data$class <- ifelse(data$class == "yes", 1, 0) # class catagory (secondary_events) being reshaped to 1 and 0 (1 = secondary event within 3 years after surgery, 0 = no secondary event within 3 years after surgery)
+
+# creating the model to be analysed by the stepwise algorithm
+
+model <- glm(class ~ .,
+             data = data,
+             family = 'binomial') 
+
+# Applying the stepwise algorithm
+
+slm1 <- step(model)
+summary(slm1)  # looking for the model, this outputs figure S1 
+
+```
+
+
+
+### Step 4: training logistic regression models and Random forest models
+
+As subsampling of the data set to create equal train and test sets for the models resulted in very drastic differences in model performance, multiple rounds of subsampling where used to generate a validation of model performance.
+
+To repeat this code it is mandatory to set the seed 5 times in order to create 5 different subsampling results. This will create different performances and ROC curves as seen below
+
+```{r}
+# trying to do stratified kfold validation myself:
+set.seed(5)
+data <- dpca
+
+min_class_count <- min(table(data$class))
+subsampled_data <- subset(data, class == "yes")[sample(min_class_count), ]
+subsampled_data <- rbind(subsampled_data, subset(data, class == "no")[sample(min_class_count), ])
+
+
+trainIndex <- createDataPartition(subsampled_data$class, p = 0.6, list = FALSE)
+
+Train <- subsampled_data[trainIndex, ]
+Test <- subsampled_data[-trainIndex, ]
+
+# subsampled_data$class <- ifelse(subsampled_data$class == 'yes', 1, 0)
+trainControl <- trainControl(
+     method = "repeatedcv",
+     number = 10,
+     repeats = 5,
+     classProbs = TRUE,
+     summaryFunction = twoClassSummary
+)
+fit <- train(
+    form = class ~  PC_2 + PC_3 + PC_9 + PC_10 + PC_16 + PC_17 + 
+    PC_22 + PC_23 + PC_27 + PC_28 + PC_30 + PC_32 + PC_33 + PC_34 + 
+    PC_35 + PC_37 + PC_41 + PC_45 + PC_49, 
+    data = Train,
+    trControl = trainControl,
+    method = "glm", 
+    family = "binomial", 
+    metric = "ROC"
+)
+
+
+predictTest <- data.frame(
+         obs = Test$class,                                    ## observed class labels
+         predict(fit, newdata = Test, type = "prob"),         ## predicted class probabilities
+         pred = predict(fit, newdata = Test, type = "raw")    ## predicted class labels
+     ) 
+
+predictTest[,'pred'] <- as.factor(predictTest[,'pred'])
+predictTest[,'obs'] <- as.factor(predictTest[,'obs'])
+twoClassSummary(data = predictTest, lev = levels(predictTest$obs))
+
+
+pred <- prediction(predictTest$yes, Test$class)
+perf5 <- performance(pred, measure = "tpr", x.measure = "fpr")
+Zauc <- performance(pred, measure = "auc")
+auc5 <- Zauc@y.values[[1]]
+auc5
+
+
+
+
+
+```
+
+
+This code generates an ROC curve of the models above and creates an average ROC curve based on the means of the 5 model curves. 
+```{r}
+x1 <- perf1@x.values[[1]]
+x2 <- perf2@x.values[[1]]
+x3 <- perf3@x.values[[1]]
+x4 <- perf4@x.values[[1]]
+x5 <- perf5@x.values[[1]]
+y1 <- perf1@y.values[[1]]
+y2 <- perf2@y.values[[1]]
+y3 <- perf3@y.values[[1]]
+y4 <- perf4@y.values[[1]]
+y5 <- perf5@y.values[[1]]
+avgx <- rowMeans(matrix(c(x1,x2,x3,x4,x5), ncol = 5))
+avgy <- rowMeans(matrix(c(y1,y2,y3,y4,y5), ncol = 5))
+avgauc <- round(mean(c(auc1,auc2,auc3,auc4,auc5)), digits = 2)
+avgauc
+
+
+gplo <- ggplot() +
+  geom_line(aes(x = x1, y = y1, ),alpha = 0.25)+
+  geom_line(aes(x = x2, y = y2, ),alpha = 0.25)+
+  geom_line(aes(x = x3, y = y3, ),alpha = 0.25)+
+  geom_line(aes(x = x4, y = y4, ),alpha = 0.25)+
+  geom_line(aes(x = x5, y = y5, ),alpha = 0.25)+
+  geom_abline(size = 1)+
+  geom_line(aes(x = avgx, y = avgy, color = 'Average of ROCs:  0.58 AUC'), size =1 )+
+  labs(title="Logistic regression model ROC curves",
+        y ="True positive rate (TPR)", x = "True negative rate (TNR)")
+
+
+gplo # Printing the plot
+
+
+```
+
+
+This code shows the random forest model training and essentially uses the same code as described above however, now uses method 'RF' in the function train to train a model using Random forest
+```{r}
+library(caret)
+set.seed(5)
+data <- dpca
+# table(data$class)
+min_class_count <- min(table(data$class))
+subsampled_data <- subset(data, class == "yes")[sample(min_class_count), ]
+subsampled_data <- rbind(subsampled_data, subset(data, class == "no")[sample(min_class_count), ])
+
+trainIndex <- createDataPartition(subsampled_data$class, p = 0.6, list = FALSE)
+
+Train <- subsampled_data[trainIndex, ]
+Test <- subsampled_data[-trainIndex, ]
+
+# data$class <- ifelse(data$class == 'yes', 1, 0)
+trainControl <- trainControl(
+     method = "repeatedcv",
+     number = 10,
+     repeats = 5,
+     classProbs = TRUE,
+     summaryFunction = twoClassSummary
+)
+fit <- train(
+    form = class ~  ., 
+    data = Train,
+    trControl = trainControl,
+    method = "rf", 
+    family = "binomial", 
+    metric = "ROC"
+)
+
+predictTest <- data.frame(
+         obs = Test$class,                                    ## observed class labels
+         predict(fit, newdata = Test, type = "prob"),         ## predicted class probabilities
+         pred = predict(fit, newdata = Test, type = "raw")    ## predicted class labels
+     ) 
+
+predictTest[,'pred'] <- as.factor(predictTest[,'pred'])
+predictTest[,'obs'] <- as.factor(predictTest[,'obs'])
+twoClassSummary(data = predictTest, lev = levels(predictTest$obs))
+
+feat5 <- varImp(fit, scale = FALSE)
+pred <- prediction(predictTest$yes, Test$class)
+Zauc <- performance(pred, measure = "auc")
+
+auc_rf_5 <- Zauc@y.values[[1]]
+perfrf_5 <- performance(pred, measure = "tpr", x.measure = "fpr")
+auc_rf_5
+# perfrf_1: top 3, 35, 19, 28
+# perfrf_2: top 3, 35, 7, 31
+# perfrf_3: top 3, 35, 36, 7
+# perfrf_4: top 3, 35, 7, 33
+# perfrf_5: top 3, 49, 35, 1 
+
+
+```
+
+
+This code generates an ROC curve of the models above and creates an average ROC curve based on the means of the 5 model curves. 
+
+
+```{r}
+xrf_1 <- perfrf_1@x.values[[1]]
+xrf_2 <- perfrf_2@x.values[[1]]
+xrf_3 <- perfrf_3@x.values[[1]]
+xrf_4 <- perfrf_4@x.values[[1]]
+xrf_5 <- perfrf_5@x.values[[1]]
+yrf_1 <- perfrf_1@y.values[[1]]
+yrf_2 <- perfrf_2@y.values[[1]]
+yrf_3 <- perfrf_3@y.values[[1]]
+yrf_4 <- perfrf_4@y.values[[1]]
+yrf_5 <- perfrf_5@y.values[[1]]
+avg_rfx <- rowMeans(matrix(c(xrf_1,xrf_2,xrf_3,xrf_4,xrf_5), ncol = 5))
+avg_rfy <- rowMeans(matrix(c(yrf_1,yrf_2,yrf_3,yrf_4,yrf_5), ncol = 5))
+avg_rfauc <- round(mean(c(auc_rf_1,auc_rf_2,auc_rf_3,auc_rf_4,auc_rf_5)), digits = 2)
+avg_rfauc
+gplo_rf <- ggplot() +
+  geom_line(aes(x = xrf_1, y = yrf_1, ),alpha = 0.25)+
+  geom_line(aes(x = xrf_2, y = yrf_2, ),alpha = 0.25)+
+  geom_line(aes(x = xrf_3, y = yrf_3, ),alpha = 0.25)+
+  geom_line(aes(x = xrf_4, y = yrf_4, ),alpha = 0.25)+
+  geom_line(aes(x = xrf_5, y = yrf_5, ),alpha = 0.25)+
+  geom_abline(size = 1)+
+  geom_line(aes(x = avg_rfx, y = avg_rfy, color = 'Average of ROCs:  0.57 AUC'), size =1 )+
+  labs(title="Random forest model ROC curves",
+        y ="True positive rate (TPR)", x = "True negative rate TNR")
+
+
+gplo_rf # plotting the ROC curves for Random forest model
+
+
+```
+
+### Step 5: To analyse the underlying genes corresponding to PC-35, python code (filename = final_pca.py) was created that is able to extract the top200 genes that are upregulated in PC-35. 
+
+The list of genes that were found by the python code (filename = final_pca.py) can be copied here to be used in the pathway analysis:
+
+
+```{r}
+
+pos_genes <- c()
+```
+
+
+### Step 6: The final step in analysing the transcriptomic data uses pathway enrichment of genes
+
+Here gene names found by the python script are changed so that they correspond with Entrezgene_id and then used in the reactome PA package. dotplot then visualises these results as shown in the thesis
+```{r}
+library("ReactomePA")
+
+library(biomaRt)
+mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+
+
+selected_up_entrez <- getBM(
+     filters="ensembl_gene_id",
+     attributes=c( "entrezgene_id"),
+     values=as.vector(pos_genes),   # Here the genes are input to be name changed
+     mart=mart
+)
+
+PA_up <- enrichPathway(gene=as.vector(selected_up_entrez[,1]),pvalueCutoff=0.1, readable=T) # genes in the selected_up_entrez are used for pathway enrichment
+
+dotplot(PA_up, showCategory=12, font.size = 8)
+```
+
+
+
+
+
+
